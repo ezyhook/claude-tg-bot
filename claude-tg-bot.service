@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram <-> Claude Code bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=arch
+WorkingDirectory=/home/arch/claude-tg-bot
+Environment=HOME=/home/arch
+Environment=PATH=/home/arch/.local/node/bin:/home/arch/.local/bin:/usr/local/bin:/usr/bin
+ExecStart=/home/arch/.local/node/bin/node --env-file=.env bot.mjs
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/arch/claude-tg-bot/bot.log
+StandardError=append:/home/arch/claude-tg-bot/bot.log
+
+[Install]
+WantedBy=multi-user.target
