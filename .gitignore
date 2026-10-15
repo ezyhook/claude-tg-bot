@@ -6,3 +6,5 @@ state.json
 state.json.*
 bot.log
 *.pre-*
+cookies.txt
+*cookies*.txt

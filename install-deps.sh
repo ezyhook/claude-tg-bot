@@ -1,6 +1,6 @@
 #!/bin/bash
 # Installs everything the bot needs besides npm packages: system tools (ffmpeg, build tools),
-# local speech-to-text (whisper.cpp + small-q5_1 model) and text-to-speech (piper + Russian voices).
+# local speech-to-text (whisper.cpp + small-q5_1 model), text-to-speech (piper + Russian voices) and yt-dlp.
 # Idempotent: already installed parts are skipped. Usage: ./install-deps.sh
 set -eo pipefail
 cd "$(dirname "$0")"
@@ -62,6 +62,15 @@ for v in dmitri irina; do
   fetch "$base.json" "$TTS/ru_RU-$v-medium.onnx.json"
 done
 ok "синтез речи: $TTS/speak.sh (голоса dmitri, irina)"
+
+# ---- YouTube and other video sites: yt-dlp (python zipapp) + config; cookies.txt is personal, never in git ----
+YTC="$HOME/.config/yt-dlp"
+mkdir -p "$HOME/.local/bin" "$YTC" && chmod 700 "$YTC"
+fetch https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp "$HOME/.local/bin/yt-dlp"
+chmod +x "$HOME/.local/bin/yt-dlp"
+[ -f "$YTC/config" ] || sed "s#~#$HOME#" deps/yt-dlp/config > "$YTC/config"
+ok "yt-dlp $("$HOME/.local/bin/yt-dlp" --version)"
+[ -f "$YTC/cookies.txt" ] || echo "⚠ YouTube через VPN требует куки: положите cookies.txt в $YTC/ (chmod 600)"
 
 # ---- bot's own npm packages ----
 [ -d "$REPO/node_modules" ] || (cd "$REPO" && npm ci --silent)

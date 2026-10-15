@@ -1,0 +1,2 @@
+--cookies ~/.config/yt-dlp/cookies.txt
+--js-runtimes node
