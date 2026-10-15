@@ -27,10 +27,11 @@ if [ ${#need[@]} -gt 0 ]; then
 fi
 ok "системные утилиты: ffmpeg, git, cmake, gcc"
 
-# ---- node + Claude Code CLI (only checked: installed separately) ----
+# ---- node (only checked: installed separately) ----
 export PATH="$HOME/.local/node/bin:$HOME/.local/bin:$PATH"
-command -v node >/dev/null || { echo "✘ нет Node.js (>=18): https://nodejs.org/en/download"; exit 1; }
-command -v claude >/dev/null || echo "⚠ нет Claude Code CLI: curl -fsSL https://claude.ai/install.sh | bash"
+command -v node >/dev/null || { echo "✘ нет Node.js (>=20.3): https://nodejs.org/en/download"; exit 1; }
+node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a>20||(a===20&&b>=3)?0:1)' \
+  || { echo "✘ нужен Node.js >= 20.3 (сейчас $(node -v))"; exit 1; }
 ok "node $(node -v)"
 
 # ---- speech to text: whisper.cpp ----
