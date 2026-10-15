@@ -1,18 +1,17 @@
-// Telegram <-> Claude Code bridge (grammY + Claude Agent SDK)
-// Works in the owner's forum group: every topic is its own Claude session with its own queue,
+// Telegram <-> Proton Lumo agent bridge (grammY + lumo-tamer OpenAI-compatible API)
+// Works in the owner's forum group: every topic is its own Lumo session with its own queue,
 // so topics don't mix and run in parallel. Messages in General go to the "main" session.
 import { Bot, InlineKeyboard, Keyboard, InputFile } from "grammy";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mdToTgHtml, splitMarkdown } from "./md2tg.mjs";
+import { runAgent, MODELS, DEFAULT_MODEL } from "./lumo.mjs";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = Number(process.env.ALLOWED_CHAT_ID);
 const OWNER_ID = Number(process.env.OWNER_ID);
 const WORK_DIR = process.env.WORK_DIR || process.cwd();
-const CLAUDE_PATH = process.env.CLAUDE_PATH || undefined;
 const STATE_FILE = new URL("./state.json", import.meta.url);
 
 if (!TOKEN || !CHAT_ID || !OWNER_ID) throw new Error("TELEGRAM_BOT_TOKEN, ALLOWED_CHAT_ID и OWNER_ID обязательны (.env)");
@@ -60,16 +59,19 @@ const VERBOSE = ["short", "full", "off"];
 function describeTool(name, input) {
   const mode = state.verbose ?? "full";
   if (mode === "off") return "";
-  const s =
-    input.command ?? input.file_path ?? input.pattern ?? input.url ?? input.query ?? input.description ?? "";
+  const s = input.command ?? input.path ?? input.file_path ?? input.query ?? "";
   if (mode === "short") {
     const line = String(s).split("\n")[0];
     return `🔧 ${name}${line ? ": " + (line.length > 200 ? line.slice(0, 200) + "…" : line) : ""}`;
   }
   // full: the whole command / query; file writes show the path and size, not the file body
-  if (input.command) return `🔧 ${name}${input.description ? ` (${input.description})` : ""}:\n\`\`\`\n${input.command.replace(/```/g, "ˋˋˋ")}\n\`\`\``;
-  if (name === "Write") return `🔧 Write: ${input.file_path} (${String(input.content ?? "").length} символов)`;
-  if (name === "Edit") return `🔧 Edit: ${input.file_path}\n- ${String(input.old_string ?? "").slice(0, 1500)}\n+ ${String(input.new_string ?? "").slice(0, 1500)}`;
+  if (input.command) return `🔧 ${name}:\n\`\`\`\n${String(input.command).replace(/```/g, "ˋˋˋ")}\n\`\`\``;
+  if (name === "write_file" || name === "append_file")
+    return `🔧 ${name}: ${input.path} (${String(input.content ?? "").split("\n").length} строк, ${String(input.content ?? "").length} символов)`;
+  if (name === "edit_file")
+    return `🔧 edit_file: ${input.path}\n- ${String(input.old_string ?? "").slice(0, 1500)}\n+ ${String(input.new_string ?? "").slice(0, 1500)}`;
+  if (name === "read_file" || name === "list_dir")
+    return `🔧 ${name}: ${input.path ?? "."}${input.start_line ? ` (${input.start_line}–${input.end_line ?? "…"})` : ""}`;
   const rest = JSON.stringify(input);
   return `🔧 ${name}: ${rest.length > 3500 ? rest.slice(0, 3500) + "…" : rest}`;
 }
@@ -79,7 +81,7 @@ const pendingPerms = new Map(); // id -> { resolve, key }
 
 const canUseToolFor = (key) => async (toolName, input, { signal }) => {
   const r = runtime(key);
-  if (r.alwaysAllowed.has(toolName)) return { behavior: "allow", updatedInput: input };
+  if (state.yolo || r.alwaysAllowed.has(toolName)) return { behavior: "allow", updatedInput: input };
   const id = randomUUID().slice(0, 8);
   const details = JSON.stringify(input, null, 2);
   const kb = new InlineKeyboard()
@@ -116,62 +118,53 @@ bot.callbackQuery(/^perm:(\w+):(allow|always|deny)$/, async (ctx) => {
   }
 });
 
-// ---- Claude runner: per topic one turn at a time (messages queued), topics in parallel ----
+// ---- Lumo runner: per topic one turn at a time (messages queued), topics in parallel ----
 const PROMPT =
   "Пользователь общается с тобой через Telegram-бота. Отвечай кратко. Markdown рендерится частично: " +
   "работают **жирный**, `код`, блоки ```кода```, ~~зачёркнутый~~, [ссылки](url), заголовки # (станут жирными) " +
   "и списки \"- \". Не используй таблицы и одиночные *курсив*/_курсив_ — они не отображаются.";
+const AGENT_PROMPT =
+  " Ты — агент на Linux-машине пользователя. Действуй сам через инструменты (run_command, read_file, list_dir, " +
+  "write_file, append_file, edit_file), не проси пользователя запускать команды. Никогда не пиши, что что-то сделал, " +
+  "создал или запустил, пока не получил результат инструмента; если инструмент вернул ошибку — скажи об этом. " +
+  "Файлы длиннее ~80 строк записывай частями: первая часть через write_file, остальные через append_file; " +
+  "для правки существующих файлов используй edit_file. Долгие процессы запускай в фоне (nohup … > log 2>&1 &). " +
+  "Никогда не выводи содержимое .env, токены и ключи.";
 
 async function runTurn(key, prompt) {
   const t = topic(key), r = runtime(key);
   const typing = setInterval(() => action(key), 4000);
   action(key);
+  const ac = new AbortController();
+  r.running = { interrupt: async () => ac.abort() };
+  if (!t.sessionId) {
+    t.sessionId = randomUUID();
+    saveState();
+  }
+  const cwd = t.cwd || WORK_DIR;
   try {
-    const q = query({
+    const lastText = await runAgent({
+      sessionId: t.sessionId,
       prompt,
-      options: {
-        cwd: t.cwd || WORK_DIR,
-        resume: t.sessionId ?? undefined,
-        pathToClaudeCodeExecutable: CLAUDE_PATH,
-        settingSources: ["user", "project", "local"],
-        systemPrompt: {
-          type: "preset",
-          preset: "claude_code",
-          append:
-            PROMPT +
-            ` Чат разбит на темы Telegram, у каждой темы своя сессия. Текущая тема: «${t.name}». ` +
-            "Держись её; если пользователь просит о чём-то совсем другом, можно предложить завести для этого отдельную тему." +
-            (t.voice ? VOICE_PROMPT : ""),
-        },
-        permissionMode: state.yolo ? "bypassPermissions" : "default",
-        allowDangerouslySkipPermissions: state.yolo,
-        canUseTool: canUseToolFor(key),
-      },
+      cwd,
+      model: state.model || DEFAULT_MODEL,
+      think: state.think,
+      signal: ac.signal,
+      system:
+        PROMPT + AGENT_PROMPT +
+        ` Рабочая папка: ${cwd}. Чат разбит на темы Telegram, у каждой темы своя сессия. Текущая тема: «${t.name}». ` +
+        "Держись её; если пользователь просит о чём-то совсем другом, можно предложить завести для этого отдельную тему." +
+        (t.voice ? VOICE_PROMPT : ""),
+      onText: (text) => send(text, key),
+      onTool: (name, input) => send(describeTool(name, input), key),
+      approve: (name, input, signal) => canUseToolFor(key)(name, input, { signal }),
     });
-    r.running = q;
-    let lastText = "";
-    for await (const msg of q) {
-      if (msg.type === "system" && msg.subtype === "init") {
-        if (t.sessionId !== msg.session_id) {
-          t.sessionId = msg.session_id;
-          saveState();
-        }
-      } else if (msg.type === "assistant") {
-        for (const block of msg.message.content) {
-          if (block.type === "text") {
-            lastText = block.text;
-            await send(block.text, key);
-          }
-          else if (block.type === "tool_use") await send(describeTool(block.name, block.input ?? {}), key);
-        }
-      } else if (msg.type === "result") {
-        if (msg.subtype !== "success") await send(`⚠️ Завершено с ошибкой: ${msg.subtype}`, key);
-        else if (t.voice && lastText) await sendVoice(lastText, key);
-      }
-    }
+    if (t.voice && lastText && !ac.signal.aborted) await sendVoice(lastText, key);
   } catch (e) {
-    console.error(e);
-    await send(`⚠️ Ошибка: ${e.message}`, key);
+    if (!ac.signal.aborted) {
+      console.error(e);
+      await send(`⚠️ Ошибка: ${e.message}`, key);
+    }
   } finally {
     r.running = null;
     clearInterval(typing);
@@ -227,7 +220,7 @@ const reply = (ctx, text, extra = {}) => bot.api.sendMessage(CHAT_ID, text, { ..
 // ---- reply-keyboard menu ----
 const handlers = {};
 const BTN = { new: "🆕 Новая сессия", stop: "⏹ Стоп", yolo: "⚡ YOLO", status: "ℹ️ Статус", topics: "🗂 Темы", hide: "🙈 Скрыть меню" };
-// trading bot reports (~/algolab/report.mjs), answered directly without Claude
+// trading bot reports (~/algolab/report.mjs), answered directly without Lumo
 const TRADE = {
   trade: { btn: "🤖 Робот", desc: "Торговый робот: состояние", arg: "status" },
   positions: { btn: "📂 Позиции", desc: "Открытые позиции", arg: "positions" },
@@ -252,10 +245,11 @@ bot.hears(BTN.hide, (ctx) => reply(ctx, "Меню скрыто. Вернуть: 
 bot.command("start", (ctx) =>
   reply(
     ctx,
-    "Привет! Пиши сообщения — я Claude Code на твоей машине.\n\n" +
+    "Привет! Пиши сообщения — я Lumo, агент на твоей машине: выполняю команды и работаю с файлами.\n\n" +
       "Каждая тема чата — отдельная сессия со своим контекстом. Новую тему создай в Telegram, первое сообщение в ней начнёт новую сессию.\n\n" +
       "/menu — показать меню\n/topics — список тем\n/new — новая сессия в этой теме\n/stop — прервать задачу в этой теме\n" +
-      "/cwd [папка] — рабочая папка темы\n/voice — голосовые ответы вкл/выкл\n/yolo — вкл/выкл автоподтверждение действий\n/status — состояние\n\n" +
+      "/cwd [папка] — рабочая папка темы\n/model [lumo|lumo-lite|lumo-max] — модель\n/think — режим размышлений вкл/выкл\n" +
+      "/voice — голосовые ответы вкл/выкл\n/yolo — вкл/выкл автоподтверждение действий\n/status — состояние\n\n" +
       "Торговый робот:\n/trade — состояние\n/positions — позиции\n/stats — статистика\n/ls — лонг/шорт и сигналы\n/div — дивергенции RSI\n/chart [монета] [дней] — графики",
     { reply_markup: menu },
   ),
@@ -330,6 +324,23 @@ handlers.yolo = async (ctx) => {
   );
 };
 
+bot.command("model", async (ctx) => {
+  const arg = String(ctx.match || "").trim().toLowerCase();
+  if (arg && !MODELS.includes(arg)) return reply(ctx, `⚠️ Нет такой модели. Доступны: ${MODELS.join(", ")}`);
+  if (arg) {
+    state.model = arg;
+    saveState();
+  }
+  await reply(ctx, `🧠 Модель: ${state.model || DEFAULT_MODEL}${arg ? " (со следующего сообщения)" : ""}\n/model ${MODELS.join(" | ")}`);
+});
+
+bot.command("think", async (ctx) => {
+  const arg = String(ctx.match || "").trim().toLowerCase();
+  state.think = arg === "on" ? true : arg === "off" ? false : !state.think;
+  saveState();
+  await reply(ctx, `${state.think ? "💭 Режим размышлений включён" : "⚡ Режим размышлений выключен"} (зависит от тарифа Proton).\n/think on | off`);
+});
+
 bot.command("verbose", async (ctx) => {
   const arg = String(ctx.match || "").trim().toLowerCase();
   state.verbose = VERBOSE.includes(arg) ? arg : VERBOSE[(VERBOSE.indexOf(state.verbose ?? "full") + 1) % VERBOSE.length];
@@ -364,6 +375,7 @@ handlers.status = (ctx) => {
     `Тема: ${t.name}\nСессия: ${t.sessionId ?? "новая"}\nПапка: ${t.cwd || WORK_DIR}\n` +
       `Выполняется здесь: ${r.running ? "да" : "нет"}, в очереди: ${r.queue.length}\n` +
       `Заняты темы: ${busy.length ? busy.join(", ") : "нет"}\n` +
+      `Модель: ${state.model || DEFAULT_MODEL}, размышления: ${state.think ? "да" : "нет"}\n` +
       `YOLO: ${state.yolo ? "да" : "нет"}\nТехнические сообщения: ${state.verbose ?? "full"}`,
   );
 };
@@ -377,7 +389,7 @@ handlers.topics = (ctx) => {
   return reply(ctx, `🗂 Темы:\n${list.join("\n") || "пока нет"}\n\nНовая тема создаётся в Telegram; её первое сообщение начнёт отдельную сессию.`);
 };
 
-// prefix the prompt with the message being replied to, so Claude sees what it refers to
+// prefix the prompt with the message being replied to, so Lumo sees what it refers to
 // (in a topic, every message "replies" to the topic's service message — that one is skipped)
 const QUOTE_MAX = 1500;
 function withReplyContext(msg, text = msg.text) {
@@ -415,7 +427,7 @@ bot.command("voice", async (ctx) => {
 
 bot.on("message:text", (ctx) => enqueue(ctx, ctx.message.text));
 
-// ---- photos, files and voice: saved to INBOX, Claude gets the path (voice: a local whisper.cpp transcript)
+// ---- photos, files and voice: saved to INBOX, Lumo gets the path (voice: a local whisper.cpp transcript)
 const INBOX = process.env.INBOX_DIR || `${process.env.HOME}/tg-inbox`;
 const STT = process.env.STT_SCRIPT || `${process.env.HOME}/.local/share/stt/transcribe.sh`;
 mkdirSync(INBOX, { recursive: true });
@@ -556,6 +568,8 @@ await bot.api.setMyCommands([
   { command: "new", description: "Новая сессия в этой теме" },
   { command: "stop", description: "Прервать задачу в этой теме" },
   { command: "cwd", description: "Рабочая папка темы" },
+  { command: "model", description: "Модель: lumo / lumo-lite / lumo-max" },
+  { command: "think", description: "Режим размышлений вкл/выкл" },
   { command: "yolo", description: "Автоподтверждение вкл/выкл" },
   { command: "status", description: "Состояние" },
   { command: "verbose", description: "Технические сообщения: short / full / off" },

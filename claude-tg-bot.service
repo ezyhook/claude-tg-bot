@@ -1,5 +1,5 @@
 [Unit]
-Description=Telegram <-> Claude Code bot
+Description=Telegram <-> Proton Lumo agent bot
 Wants=network-online.target
 After=network-online.target
 
