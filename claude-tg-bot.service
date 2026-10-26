@@ -5,15 +5,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=arch
-WorkingDirectory=/home/arch/claude-tg-bot
-Environment=HOME=/home/arch
-Environment=PATH=/home/arch/.local/node/bin:/home/arch/.local/bin:/usr/local/bin:/usr/bin
-ExecStart=/home/arch/.local/node/bin/node --env-file=.env bot.mjs
+WorkingDirectory=%h/claude-tg-bot
+Environment=PATH=%h/.local/node/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/node/bin/node --env-file=.env bot.mjs
 Restart=always
 RestartSec=5
-StandardOutput=append:/home/arch/claude-tg-bot/bot.log
-StandardError=append:/home/arch/claude-tg-bot/bot.log
+StandardOutput=append:%h/claude-tg-bot/bot.log
+StandardError=append:%h/claude-tg-bot/bot.log
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target
