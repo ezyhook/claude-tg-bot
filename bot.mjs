@@ -234,12 +234,22 @@ const TRADE = {
   stats: { btn: "📈 Статистика", desc: "Статистика торговли", arg: "stats" },
   ls: { btn: "📊 Лонг/шорт", desc: "Соотношение лонг/шорт и сигналы", arg: "ls" },
   div: { btn: "📐 Дивергенции", desc: "Дивергенции RSI (1h/4h/1d)", arg: "div" },
+  // the Hyperliquid instance (report.mjs --hl)
+  hltrade: { btn: "🤖 Робот HL", desc: "Hyperliquid: состояние робота", arg: "status", hl: true },
+  hlpositions: { btn: "📂 Позиции HL", desc: "Hyperliquid: открытые позиции", arg: "positions", hl: true },
+  hlstats: { btn: "📈 Статистика HL", desc: "Hyperliquid: статистика торговли", arg: "stats", hl: true },
 };
 const CHART = { btn: "📉 Графики", desc: "График лонг/шорт: /chart [SOL] [дней]" };
+const LIQ = { btn: "🔥 Ликвидации", desc: "Цена, карта ликвидаций и толпа: /liq [BTC] [дней]" };
+const BOARD = { btn: "🧭 Борд OKX", desc: "Борд робота OKX: статус, позиции, толпа (картинка)" };
+const HLBOARD = { btn: "🧭 Борд HL", desc: "Борд робота Hyperliquid (картинка)" };
 const menu = new Keyboard()
+  .text(HLBOARD.btn).text(TRADE.hltrade.btn).row()
+  .text(TRADE.hlpositions.btn).text(TRADE.hlstats.btn).row()
+  .text(BOARD.btn).row()
   .text(TRADE.trade.btn).text(TRADE.positions.btn).row()
   .text(TRADE.stats.btn).text(TRADE.ls.btn).row()
-  .text(CHART.btn).text(TRADE.div.btn).row()
+  .text(CHART.btn).text(LIQ.btn).text(TRADE.div.btn).row()
   .text(BTN.new).text(BTN.stop).row()
   .text(BTN.yolo).text(BTN.status).row()
   .text(BTN.topics).text(BTN.hide)
@@ -262,10 +272,10 @@ bot.command("start", (ctx) =>
 );
 
 const ALGOLAB = process.env.ALGOLAB_DIR || `${process.env.HOME}/algolab`;
-function tradeReport(ctx, arg) {
+function tradeReport(ctx, arg, hl = false) {
   const key = keyOf(ctx.msg);
   action(key);
-  execFile(process.execPath, ["report.mjs", arg], { cwd: ALGOLAB, timeout: 60e3 }, (err, stdout, stderr) =>
+  execFile(process.execPath, ["report.mjs", arg, ...(hl ? ["--hl"] : [])], { cwd: ALGOLAB, timeout: 60e3 }, (err, stdout, stderr) =>
     send(err ? `⚠️ Отчёт не получен: ${(stderr || err.message).slice(0, 500)}` : stdout, key),
   );
 }
@@ -288,11 +298,46 @@ function sendCharts(ctx, args = "") {
   }
 }
 bot.command("chart", (ctx) => sendCharts(ctx, ctx.match));
+
+// liquidation board (~/algolab/liq_board.mjs): /liq -> BTC, ETH, SOL for 14 days, /liq SOL 30
+function sendLiq(ctx, args = "") {
+  const key = keyOf(ctx.msg);
+  const [coinArg, daysArg] = args.trim().split(/\s+/);
+  const coins = coinArg ? [coinArg.toUpperCase()] : ["BTC", "ETH", "SOL"];
+  const days = String(Math.min(Math.max(Number(daysArg) || 14, 2), 90));
+  for (const coin of coins) {
+    if (!["BTC", "ETH", "SOL"].includes(coin)) return send("Формат: /liq [BTC|ETH|SOL] [дней]", key);
+    action(key, "upload_photo");
+    const out = `/tmp/liq_${coin}_${Date.now()}.png`;
+    execFile(process.execPath, ["liq_board.mjs", coin, days, out], { cwd: ALGOLAB, timeout: 120e3 }, (err, stdout, stderr) => {
+      if (err) return send(`⚠️ Карта ${coin} не построена: ${(stderr || err.message).split("\n").find((l) => /Error|error/.test(l)) || err.message}`.slice(0, 500), key);
+      bot.api.sendPhoto(CHAT_ID, new InputFile(out), { caption: `🔥 ${coin}: цена, карта ликвидаций и толпа, ${days} дн.`, ...threadOf(key) })
+        .catch((e) => send(`⚠️ ${e.message}`, key));
+    });
+  }
+}
+bot.command("liq", (ctx) => sendLiq(ctx, ctx.match));
+bot.hears(LIQ.btn, (ctx) => sendLiq(ctx));
 bot.hears(CHART.btn, (ctx) => sendCharts(ctx));
 
+// visual dashboard of the trading bot (~/algolab/board.mjs)
+function sendBoard(ctx, hl = false) {
+  const key = keyOf(ctx.msg), out = `/tmp/board_${Date.now()}.png`;
+  action(key, "upload_photo");
+  execFile(process.execPath, ["board.mjs", out, ...(hl ? ["--hl"] : [])], { cwd: ALGOLAB, timeout: 120e3 }, (err, stdout, stderr) => {
+    if (err) return send(`⚠️ Борд не построен: ${(stderr || err.message).split("\n").find((l) => /Error|error/.test(l)) || err.message}`.slice(0, 500), key);
+    bot.api.sendPhoto(CHAT_ID, new InputFile(out), { caption: `🧭 Торговый робот ${hl ? "Hyperliquid" : "OKX"}: статус и позиции`, ...threadOf(key) })
+      .catch((e) => send(`⚠️ ${e.message}`, key));
+  });
+}
+bot.command("board", (ctx) => sendBoard(ctx));
+bot.hears(BOARD.btn, (ctx) => sendBoard(ctx));
+bot.command("hlboard", (ctx) => sendBoard(ctx, true));
+bot.hears(HLBOARD.btn, (ctx) => sendBoard(ctx, true));
+
 for (const [cmd, t] of Object.entries(TRADE)) {
-  bot.command(cmd, (ctx) => tradeReport(ctx, t.arg));
-  bot.hears(t.btn, (ctx) => tradeReport(ctx, t.arg));
+  bot.command(cmd, (ctx) => tradeReport(ctx, t.arg, t.hl));
+  bot.hears(t.btn, (ctx) => tradeReport(ctx, t.arg, t.hl));
 }
 
 bot.hears(BTN.new, (ctx) => handlers.new(ctx));
@@ -411,6 +456,23 @@ bot.command("voice", async (ctx) => {
     `${t.voice ? "🔊 Голосовые ответы в теме «" + t.name + "» включены" : "🔇 Голосовые ответы в теме «" + t.name + "» выключены"}. ` +
       `Голос: ${state.ttsVoice || "dmitri"}.\n/voice on | off | irina | dmitri`,
   );
+});
+
+// subscription limits; shortcut: undocumented endpoint Claude Code's /usage uses, may change without notice
+bot.command("usage", async (ctx) => {
+  try {
+    const { accessToken } = JSON.parse(readFileSync(`${process.env.HOME}/.claude/.credentials.json`, "utf8")).claudeAiOauth;
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+      headers: { Authorization: `Bearer ${accessToken}`, "anthropic-beta": "oauth-2025-04-20" },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const u = await res.json();
+    const at = (t) => new Date(t).toLocaleString("ru-RU", { timeZone: "Europe/Warsaw", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+    const line = (name, x) => (x ? `${name}: ${Math.round(x.utilization)}% (сброс ${at(x.resets_at)})` : null);
+    await reply(ctx, ["📊 Лимиты подписки", line("5 часов", u.five_hour), line("Неделя", u.seven_day), line("Неделя Opus", u.seven_day_opus)].filter(Boolean).join("\n"));
+  } catch (e) {
+    await reply(ctx, `⚠️ Не удалось получить лимиты: ${e.message}`);
+  }
 });
 
 bot.on("message:text", (ctx) => enqueue(ctx, ctx.message.text));
@@ -558,10 +620,14 @@ await bot.api.setMyCommands([
   { command: "cwd", description: "Рабочая папка темы" },
   { command: "yolo", description: "Автоподтверждение вкл/выкл" },
   { command: "status", description: "Состояние" },
+  { command: "usage", description: "Лимиты подписки Claude, %" },
   { command: "verbose", description: "Технические сообщения: short / full / off" },
   { command: "voice", description: "Голосовые ответы вкл/выкл, голос irina / dmitri" },
+  { command: "hlboard", description: HLBOARD.desc },
+  { command: "board", description: BOARD.desc },
   ...Object.entries(TRADE).map(([command, t]) => ({ command, description: t.desc })),
   { command: "chart", description: CHART.desc },
+  { command: "liq", description: LIQ.desc },
 ]);
 // replaces any old reply keyboard in the chat with the new menu
 await bot.api.sendMessage(CHAT_ID, "🟢 Бот запущен. Пиши!", { reply_markup: menu }).catch((e) => console.error("send:", e.message));
